@@ -1,0 +1,837 @@
+substitutions:
+  device_name: "tankmonitor-cisterna"
+  friendly_name: "TankMonitor Cisterna"
+  project_version: "2.3.0"
+
+  # Validità ELETTRICA del loop. La calibrazione idraulica è lato HACS.
+  loop_min_valid_ma: "3.0"
+  loop_max_valid_ma: "21.5"
+
+esphome:
+  name: ${device_name}
+  friendly_name: ${friendly_name}
+  comment: "TankMonitor REV2.3 HA - XIAO ESP32-C6 + TL-136 + INA228"
+  project:
+    name: "fpapale.tankmonitor"
+    version: "${project_version}"
+
+  on_boot:
+    - priority: 800
+      then:
+        - lambda: |-
+            id(boot_millis) = millis();
+
+    - priority: -100
+      then:
+        - script.execute: boot_coordinator
+
+esp32:
+  board: seeed_xiao_esp32c6
+  framework:
+    type: esp-idf
+
+logger:
+  level: INFO
+
+preferences:
+  flash_write_interval: 1s
+
+# External component locale: gestisce fino a 5 profili Wi-Fi,
+# IPv4 statico runtime e rollback automatico a DHCP.
+external_components:
+  - source:
+      type: local
+      path: components
+    components:
+      - tankmonitor_network
+
+tankmonitor_network:
+  id: tank_net
+  max_profiles: 5
+  static_validation_timeout: 8s
+  dhcp_fallback_timeout: 10s
+  maintenance_ap_timeout: 15s
+
+# Nessun SSID/password/IP domestico è presente nel firmware.
+# Al primo avvio (o in recovery) l'AP di fallback + captive portal
+# consente di scegliere una rete visibile.
+wifi:
+  id: wifi_ctrl
+  enable_on_boot: false
+  reboot_timeout: 0s
+
+  fast_connect:
+    enabled: true
+    storage: rtc
+
+  power_save_mode: NONE
+  min_auth_mode: WPA2
+
+  ap:
+    ssid: "TankMonitor Setup"
+    password: !secret tankmonitor_setup_ap_password
+    ap_timeout: 0s
+
+captive_portal:
+
+# Utile anche per provisioning via USB.
+improv_serial:
+
+api:
+  id: api_server
+  reboot_timeout: 0s
+  batch_delay: 50ms
+
+  encryption:
+    key: !secret tankmonitor_api_key
+
+  actions:
+    # ----------------------------
+    # Parametri operativi
+    # ----------------------------
+    - action: set_measurement_enabled
+      variables:
+        enabled: bool
+      then:
+        - if:
+            condition:
+              lambda: 'return enabled;'
+            then:
+              - switch.turn_on: measurement_enabled_control
+            else:
+              - switch.turn_off: measurement_enabled_control
+
+    - action: set_sleep_minutes
+      variables:
+        minutes: int
+      then:
+        - number.set:
+            id: sleep_minutes_control
+            value: !lambda |-
+              if (minutes < 15) return 15.0f;
+              if (minutes > 1440) return 1440.0f;
+              return static_cast<float>(minutes);
+
+    - action: set_warmup_seconds
+      variables:
+        seconds: int
+      then:
+        - number.set:
+            id: warmup_seconds_control
+            value: !lambda |-
+              if (seconds < 1) return 1.0f;
+              if (seconds > 15) return 15.0f;
+              return static_cast<float>(seconds);
+
+    - action: force_measurement
+      then:
+        - if:
+            condition:
+              binary_sensor.is_on: maintenance_mode
+            then:
+              - script.execute: sample_cycle
+            else:
+              - logger.log:
+                  level: WARN
+                  format: "Force Measurement disponibile solo in maintenance mode"
+
+    # ----------------------------
+    # Network Manager
+    # Le password sono parametri API, non entità.
+    # ----------------------------
+    - action: network_add_profile
+      variables:
+        ssid: string
+        password: string
+        priority: int
+      then:
+        - lambda: |-
+            const bool ok = id(tank_net).add_or_update_profile(ssid, password, priority);
+            ESP_LOGI("tankmonitor.net", "network_add_profile(%s): %s",
+                     ssid.c_str(), ok ? "OK" : "FAILED");
+
+    - action: network_remove_profile
+      variables:
+        ssid: string
+      then:
+        - lambda: |-
+            const bool ok = id(tank_net).remove_profile(ssid);
+            ESP_LOGI("tankmonitor.net", "network_remove_profile(%s): %s",
+                     ssid.c_str(), ok ? "OK" : "NOT FOUND");
+
+    - action: network_use_dhcp
+      variables:
+        ssid: string
+      then:
+        - lambda: |-
+            const bool ok = id(tank_net).set_dhcp(ssid);
+            ESP_LOGI("tankmonitor.net", "network_use_dhcp(%s): %s",
+                     ssid.c_str(), ok ? "OK" : "NOT FOUND");
+
+    - action: network_set_static
+      variables:
+        ssid: string
+        static_ip: string
+        gateway: string
+        subnet: string
+        dns1: string
+        dns2: string
+      then:
+        - lambda: |-
+            const bool ok = id(tank_net).set_static(
+              ssid, static_ip, gateway, subnet, dns1, dns2
+            );
+            ESP_LOGI("tankmonitor.net",
+                     "network_set_static(%s): %s - verrà validato al prossimo wake",
+                     ssid.c_str(), ok ? "PENDING" : "FAILED");
+
+    - action: network_scan
+      then:
+        - lambda: |-
+            id(tank_net).start_scan();
+
+    - action: network_clear_all_profiles
+      then:
+        - lambda: |-
+            id(tank_net).clear_profiles();
+
+ota:
+  - platform: esphome
+    password: !secret tankmonitor_ota_password
+
+i2c:
+  id: i2c_bus
+  sda: GPIO22
+  scl: GPIO23
+  frequency: 400kHz
+  scan: false
+
+deep_sleep:
+  id: deep_sleep_ctrl
+
+  esp32_ext1_wakeup:
+    pins:
+      - GPIO1
+    mode: ANY_HIGH
+
+globals:
+  - id: boot_millis
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+
+  - id: sleep_minutes_value
+    type: float
+    restore_value: yes
+    update_interval: 1s
+    initial_value: '180.0'
+
+  - id: warmup_seconds_value
+    type: float
+    restore_value: yes
+    update_interval: 1s
+    initial_value: '3.0'
+
+  - id: measurement_enabled_value
+    type: bool
+    restore_value: yes
+    update_interval: 1s
+    initial_value: 'true'
+
+  - id: ina_mode_write_ok
+    type: bool
+    restore_value: no
+    initial_value: 'true'
+
+switch:
+  # D2 / GPIO2 -> Q2/Q1 -> boost + TL-136
+  - platform: gpio
+    id: sensor_power
+    internal: true
+    pin:
+      number: GPIO2
+      mode:
+        output: true
+    restore_mode: ALWAYS_OFF
+
+  # D3 / GPIO21 -> abilita il divisore batteria
+  - platform: gpio
+    id: battery_adc_enable
+    internal: true
+    pin:
+      number: GPIO21
+      mode:
+        output: true
+    restore_mode: ALWAYS_OFF
+
+  - platform: template
+    id: measurement_enabled_control
+    name: "Measurement Enabled"
+    icon: "mdi:gauge"
+    lambda: |-
+      return id(measurement_enabled_value);
+
+    turn_on_action:
+      - lambda: |-
+          id(measurement_enabled_value) = true;
+
+    turn_off_action:
+      - lambda: |-
+          id(measurement_enabled_value) = false;
+      - switch.turn_off: sensor_power
+
+number:
+  - platform: template
+    id: sleep_minutes_control
+    name: "Sleep Interval"
+    icon: "mdi:sleep"
+    unit_of_measurement: "min"
+    min_value: 15
+    max_value: 1440
+    step: 15
+    lambda: |-
+      return id(sleep_minutes_value);
+    set_action:
+      - lambda: |-
+          id(sleep_minutes_value) = x;
+          ESP_LOGI("tankmonitor", "Sleep interval: %.0f min", x);
+
+  - platform: template
+    id: warmup_seconds_control
+    name: "TL-136 Warm-up"
+    icon: "mdi:timer-sand"
+    unit_of_measurement: "s"
+    min_value: 1
+    max_value: 15
+    step: 1
+    lambda: |-
+      return id(warmup_seconds_value);
+    set_action:
+      - lambda: |-
+          id(warmup_seconds_value) = x;
+          ESP_LOGI("tankmonitor", "TL-136 warm-up: %.0f s", x);
+
+binary_sensor:
+  - platform: gpio
+    id: maintenance_reed
+    name: "Maintenance Reed"
+    entity_category: diagnostic
+    pin:
+      number: GPIO1
+      mode:
+        input: true
+
+  - platform: template
+    id: measurement_valid
+    name: "Measurement Valid"
+
+  - platform: template
+    id: sensor_fault
+    name: "Sensor Fault"
+    device_class: problem
+
+  - platform: template
+    id: battery_low
+    name: "Battery Low"
+    device_class: battery
+
+  - platform: template
+    id: battery_critical
+    name: "Battery Critical"
+    device_class: battery
+
+  - platform: template
+    id: maintenance_mode
+    name: "Maintenance Mode"
+    entity_category: diagnostic
+
+  - platform: template
+    id: static_ip_fallback
+    name: "Static IP Fallback"
+    entity_category: diagnostic
+    lambda: |-
+      return id(tank_net).is_static_fallback_active();
+
+  - platform: template
+    id: static_ip_pending
+    name: "Static IP Pending"
+    entity_category: diagnostic
+    lambda: |-
+      return id(tank_net).has_pending_static();
+
+sensor:
+  - platform: ina2xx_i2c
+    id: ina228
+    model: INA228
+    i2c_id: i2c_bus
+    address: 0x40
+
+    shunt_resistance: 5.10 ohm
+    max_current: 0.025 A
+    adc_range: 0
+
+    adc_averaging: 16
+    adc_time: 1052us
+    update_interval: never
+
+    current:
+      id: loop_current
+      name: "Loop Current"
+      device_class: current
+      state_class: measurement
+      unit_of_measurement: "mA"
+      accuracy_decimals: 3
+      filters:
+        - multiply: 1000.0
+
+    shunt_voltage:
+      id: loop_shunt_voltage
+      name: "Loop Shunt Voltage"
+      entity_category: diagnostic
+      unit_of_measurement: "mV"
+      accuracy_decimals: 3
+
+  - platform: adc
+    id: battery_voltage
+    name: "Battery Voltage"
+    pin: GPIO0
+    attenuation: 12db
+    samples: 16
+    sampling_mode: avg
+    update_interval: never
+    device_class: voltage
+    state_class: measurement
+    unit_of_measurement: "V"
+    accuracy_decimals: 3
+    filters:
+      - multiply: 2.0
+
+  - platform: template
+    id: battery_percent
+    name: "Battery Level"
+    device_class: battery
+    state_class: measurement
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    update_interval: never
+    lambda: |-
+      const float v = id(battery_voltage).state;
+      if (!std::isfinite(v)) return NAN;
+
+      if (v >= 4.15f) return 100.0f;
+      if (v >= 4.00f) return 90.0f + (v - 4.00f) / 0.15f * 10.0f;
+      if (v >= 3.85f) return 70.0f + (v - 3.85f) / 0.15f * 20.0f;
+      if (v >= 3.75f) return 50.0f + (v - 3.75f) / 0.10f * 20.0f;
+      if (v >= 3.65f) return 25.0f + (v - 3.65f) / 0.10f * 25.0f;
+      if (v >= 3.50f) return 10.0f + (v - 3.50f) / 0.15f * 15.0f;
+      if (v >= 3.30f) return (v - 3.30f) / 0.20f * 10.0f;
+      return 0.0f;
+
+  - platform: wifi_signal
+    id: wifi_rssi
+    name: "WiFi RSSI"
+    entity_category: diagnostic
+    update_interval: never
+
+  - platform: template
+    id: awake_time
+    name: "Awake Time"
+    entity_category: diagnostic
+    unit_of_measurement: "s"
+    accuracy_decimals: 1
+    update_interval: never
+
+text_sensor:
+  - platform: wifi_info
+    ip_address:
+      id: network_ip
+      name: "Network IP"
+      entity_category: diagnostic
+    ssid:
+      id: network_ssid
+      name: "Network SSID"
+      entity_category: diagnostic
+    scan_results:
+      id: network_scan_results
+      name: "Available WiFi Networks"
+      entity_category: diagnostic
+
+  - platform: template
+    id: network_mode
+    name: "Network Mode"
+    entity_category: diagnostic
+    update_interval: never
+    lambda: |-
+      return id(tank_net).current_mode();
+
+  - platform: template
+    id: network_profiles
+    name: "Network Profiles"
+    entity_category: diagnostic
+    update_interval: never
+    lambda: |-
+      return id(tank_net).profile_summary();
+
+  - platform: template
+    id: wakeup_reason
+    name: "Wakeup Reason"
+    entity_category: diagnostic
+    update_interval: never
+
+  - platform: template
+    id: last_error
+    name: "Last Error"
+    entity_category: diagnostic
+    update_interval: never
+
+  - platform: template
+    id: firmware_version
+    name: "Firmware Version"
+    entity_category: diagnostic
+    update_interval: never
+
+button:
+  - platform: template
+    id: force_measurement_button
+    name: "Force Measurement"
+    icon: "mdi:water-sync"
+    on_press:
+      - if:
+          condition:
+            binary_sensor.is_on: maintenance_mode
+          then:
+            - script.execute: sample_cycle
+          else:
+            - logger.log:
+                level: WARN
+                format: "Force Measurement disponibile solo in maintenance mode"
+
+  - platform: template
+    id: sleep_now_button
+    name: "Sleep Now"
+    icon: "mdi:power-sleep"
+    on_press:
+      - script.execute: go_to_sleep
+
+  - platform: template
+    id: wifi_scan_button
+    name: "Scan WiFi"
+    icon: "mdi:wifi-find"
+    on_press:
+      - lambda: |-
+          id(tank_net).start_scan();
+
+script:
+  # INA228 ADC_CONFIG (0x01): modifica solo MODE[15:12].
+  - id: ina228_enable
+    mode: restart
+    then:
+      - lambda: |-
+          id(ina_mode_write_ok) = false;
+
+          uint8_t data[2] = {0, 0};
+          auto err = id(ina228).read_register(0x01, data, 2);
+
+          if (err != esphome::i2c::ERROR_OK) {
+            ESP_LOGW("tankmonitor", "INA228 ADC_CONFIG read failed");
+            return;
+          }
+
+          uint16_t cfg =
+              (static_cast<uint16_t>(data[0]) << 8) |
+              static_cast<uint16_t>(data[1]);
+
+          cfg = (cfg & 0x0FFFu) | 0xF000u;
+
+          const uint8_t out[2] = {
+            static_cast<uint8_t>((cfg >> 8) & 0xFF),
+            static_cast<uint8_t>(cfg & 0xFF)
+          };
+
+          err = id(ina228).write_register(0x01, out, 2);
+          id(ina_mode_write_ok) = (err == esphome::i2c::ERROR_OK);
+
+  - id: ina228_shutdown
+    mode: restart
+    then:
+      - lambda: |-
+          uint8_t data[2] = {0, 0};
+          auto err = id(ina228).read_register(0x01, data, 2);
+
+          if (err != esphome::i2c::ERROR_OK) {
+            ESP_LOGW("tankmonitor", "INA228 shutdown read failed");
+            return;
+          }
+
+          uint16_t cfg =
+              (static_cast<uint16_t>(data[0]) << 8) |
+              static_cast<uint16_t>(data[1]);
+
+          cfg &= 0x0FFFu;
+
+          const uint8_t out[2] = {
+            static_cast<uint8_t>((cfg >> 8) & 0xFF),
+            static_cast<uint8_t>(cfg & 0xFF)
+          };
+
+          id(ina228).write_register(0x01, out, 2);
+
+  - id: measure_battery
+    mode: restart
+    then:
+      - switch.turn_on: battery_adc_enable
+      - delay: 100ms
+      - component.update: battery_voltage
+      - delay: 30ms
+      - component.update: battery_percent
+      - delay: 20ms
+      - lambda: |-
+          const float v = id(battery_voltage).state;
+          const float pct = id(battery_percent).state;
+
+          if (!std::isfinite(v) || v < 2.5f || v > 4.5f) {
+            id(battery_low).publish_state(true);
+            id(battery_critical).publish_state(true);
+            id(last_error).publish_state("BATTERY_ADC_INVALID");
+          } else {
+            id(battery_low).publish_state(std::isfinite(pct) && pct <= 20.0f);
+            id(battery_critical).publish_state(std::isfinite(pct) && pct <= 10.0f);
+          }
+      - switch.turn_off: battery_adc_enable
+
+  - id: measure_tank
+    mode: restart
+    then:
+      - if:
+          condition:
+            lambda: 'return id(measurement_enabled_value);'
+          then:
+            - script.execute: ina228_enable
+            - script.wait: ina228_enable
+            - delay: 100ms
+
+            - switch.turn_on: sensor_power
+
+            - delay: !lambda |-
+                return static_cast<uint32_t>(
+                  id(warmup_seconds_value) * 1000.0f
+                );
+
+            - component.update: ina228
+            - delay: 300ms
+
+            - switch.turn_off: sensor_power
+
+            - lambda: |-
+                const float ma = id(loop_current).state;
+
+                if (!id(ina_mode_write_ok)) {
+                  id(measurement_valid).publish_state(false);
+                  id(sensor_fault).publish_state(true);
+                  id(last_error).publish_state("INA228_CONFIG_ERROR");
+                } else if (!std::isfinite(ma)) {
+                  id(measurement_valid).publish_state(false);
+                  id(sensor_fault).publish_state(true);
+                  id(last_error).publish_state("INA228_NO_DATA");
+                } else if (
+                  ma < ${loop_min_valid_ma}f ||
+                  ma > ${loop_max_valid_ma}f
+                ) {
+                  id(measurement_valid).publish_state(false);
+                  id(sensor_fault).publish_state(true);
+                  id(last_error).publish_state("LOOP_CURRENT_OUT_OF_RANGE");
+                } else {
+                  id(measurement_valid).publish_state(true);
+                  id(sensor_fault).publish_state(false);
+                  id(last_error).publish_state("OK");
+                }
+
+            - script.execute: ina228_shutdown
+            - script.wait: ina228_shutdown
+
+          else:
+            - switch.turn_off: sensor_power
+            - lambda: |-
+                id(loop_current).publish_state(NAN);
+                id(measurement_valid).publish_state(false);
+                id(sensor_fault).publish_state(false);
+                id(last_error).publish_state("MEASUREMENT_DISABLED");
+            - script.execute: ina228_shutdown
+            - script.wait: ina228_shutdown
+
+  - id: sample_cycle
+    mode: restart
+    then:
+      - script.execute: measure_battery
+      - script.wait: measure_battery
+      - script.execute: measure_tank
+      - script.wait: measure_tank
+
+  - id: network_sync
+    mode: restart
+    then:
+      - lambda: |-
+          id(tank_net).prepare_normal();
+
+      - wifi.enable
+
+      # Con una config statica pending, tank_net può fare internamente
+      # static -> DHCP fallback; per questo la finestra è un po' più ampia.
+      - wait_until:
+          condition:
+            wifi.connected:
+          timeout: 22s
+
+      - if:
+          condition:
+            wifi.connected:
+          then:
+            - component.update: wifi_rssi
+
+            - wait_until:
+                condition:
+                  api.connected:
+                    state_subscription_only: true
+                timeout: 20s
+
+            - if:
+                condition:
+                  api.connected:
+                    state_subscription_only: true
+                then:
+                  - lambda: |-
+                      id(tank_net).confirm_backend_connected();
+                      id(awake_time).publish_state(
+                        (millis() - id(boot_millis)) / 1000.0f
+                      );
+                  - component.update: network_mode
+                  - component.update: network_profiles
+                  - delay: 3s
+                else:
+                  - lambda: |-
+                      id(last_error).publish_state("HOME_ASSISTANT_API_TIMEOUT");
+          else:
+            - lambda: |-
+                id(last_error).publish_state("WIFI_TIMEOUT");
+
+      - wifi.disable
+
+  - id: normal_cycle
+    mode: restart
+    then:
+      - binary_sensor.template.publish:
+          id: maintenance_mode
+          state: OFF
+      - script.execute: sample_cycle
+      - script.wait: sample_cycle
+      - script.execute: network_sync
+      - script.wait: network_sync
+      - script.execute: go_to_sleep
+
+  - id: maintenance_cycle
+    mode: restart
+    then:
+      - binary_sensor.template.publish:
+          id: maintenance_mode
+          state: ON
+
+      - script.execute: sample_cycle
+      - script.wait: sample_cycle
+
+      - lambda: |-
+          id(tank_net).prepare_maintenance();
+
+      - wifi.enable
+
+      # Se non esistono reti valide, dopo il timeout viene attivato
+      # "TankMonitor Setup" e captive_portal consente di scegliere
+      # una delle reti rilevate.
+      - delay: 10min
+
+      - if:
+          condition:
+            api.connected:
+              state_subscription_only: true
+          then:
+            - lambda: |-
+                id(tank_net).confirm_backend_connected();
+
+      - binary_sensor.template.publish:
+          id: maintenance_mode
+          state: OFF
+      - wifi.disable
+      - script.execute: go_to_sleep
+
+  - id: boot_coordinator
+    mode: restart
+    then:
+      - switch.turn_off: sensor_power
+      - switch.turn_off: battery_adc_enable
+
+      - lambda: |-
+          id(firmware_version).publish_state("${project_version}");
+
+          const auto cause = esp_sleep_get_wakeup_cause();
+          switch (cause) {
+            case ESP_SLEEP_WAKEUP_EXT1:
+              id(wakeup_reason).publish_state("MAGNET_EXT1");
+              break;
+            case ESP_SLEEP_WAKEUP_TIMER:
+              id(wakeup_reason).publish_state("TIMER");
+              break;
+            case ESP_SLEEP_WAKEUP_UNDEFINED:
+              id(wakeup_reason).publish_state("POWER_ON_OR_RESET");
+              break;
+            default:
+              id(wakeup_reason).publish_state("OTHER");
+              break;
+          }
+
+      - if:
+          condition:
+            lambda: |-
+              const auto cause = esp_sleep_get_wakeup_cause();
+              return cause == ESP_SLEEP_WAKEUP_EXT1 ||
+                     cause == ESP_SLEEP_WAKEUP_UNDEFINED;
+          then:
+            - script.execute: maintenance_cycle
+          else:
+            - script.execute: normal_cycle
+
+  - id: go_to_sleep
+    mode: restart
+    then:
+      - switch.turn_off: sensor_power
+      - switch.turn_off: battery_adc_enable
+
+      - script.execute: ina228_shutdown
+      - script.wait: ina228_shutdown
+
+      - lambda: |-
+          id(awake_time).publish_state(
+            (millis() - id(boot_millis)) / 1000.0f
+          );
+
+      # Evita un loop immediato se il magnete è ancora sul reed.
+      - if:
+          condition:
+            binary_sensor.is_on: maintenance_reed
+          then:
+            - wait_until:
+                condition:
+                  binary_sensor.is_off: maintenance_reed
+
+      - delay: 100ms
+
+      - deep_sleep.enter:
+          id: deep_sleep_ctrl
+          sleep_duration: !lambda |-
+            if (!id(measurement_enabled_value)) {
+              return static_cast<uint32_t>(
+                24UL * 60UL * 60UL * 1000UL
+              );
+            }
+
+            return static_cast<uint32_t>(
+              id(sleep_minutes_value) * 60.0f * 1000.0f
+            );
